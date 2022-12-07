@@ -13,9 +13,6 @@
 #define CURSOR_SIZE_X (6 * CURSOR_SIZE_SCALE)
 #define CURSOR_SIZE_Y (8 * CURSOR_SIZE_SCALE)
 
-#define STATUS_BAR_LEFT_SIZE 20
-#define STATUS_BAR_RIGHT_SIZE 16
-
 #define COLOR_3B_BLACK 0
 #define COLOR_3B_DARK_GREY 4
 #define COLOR_3B_LIGHT_GREY 6
@@ -24,12 +21,14 @@
 #define COLOR_1B_BLACK 1
 #define COLOR_1B_WHITE 0
 
-#define CONFIG_FILENAME "/config.json"
+#define CONFIG_FILENAME "/libera.json"
 #define CONFIG_DOC_SIZE 2048
 #define CONFIG_STRING_SIZE 32
 
-#define WIFI_CONNECTION_TIMEOUT 30000
-#define TIME_SYNC_TIMEOUT 10
+#define WIFI_CONNECTION_TIMEOUT_MS 30000
+#define WIFI_CONNECTION_CHECK_INTERVAL_MS 500
+#define TIME_SYNC_TIMEOUT_S 10
+#define TIME_CLOCK_FORMAT "m/d H:i"
 
 /*** CONFIG SCHEMA (sd-card:/config.json)
 {
@@ -92,11 +91,8 @@ struct _Config {
 };
 
 Inkplate display(INKPLATE_1BIT);
-WiFiClient wificlient;
-IRCClient* ircclient = NULL;
-
-char StatusBarLeftText[STATUS_BAR_LEFT_SIZE];
-char StatusBarRightText[STATUS_BAR_RIGHT_SIZE];
+WiFiClient wifiClient;
+IRCClient* ircClient = NULL;
 
 unsigned long _lastFullRefresh;
 unsigned long _lastPartialRefresh;
@@ -136,20 +132,19 @@ void ircCallback(IRCMessage ircMessage) {
   Serial.println("R< " + ircMessage.original);
   if (ircMessage.command == "PRIVMSG" && ircMessage.text[0] != '\001') {
     String message("<" + ircMessage.nick + "> " + ircMessage.text);
-    display.setCursor(1 * CURSOR_SIZE_X, _lastUsedLine++ * CURSOR_SIZE_Y);
     display.setTextWrap(true);
     display.setTextColor(COLOR_1B_BLACK);
-
     Serial.println(message);
-    display.println(message);
 
-    updateDisplay(false);
-
-    _lastUsedLine += willWrap(message.length());
-    if(((1 + _lastUsedLine) * CURSOR_SIZE_Y) > display.height()) {
+    if(((_lastUsedLine + willWrap(message.length()) + 1) * CURSOR_SIZE_Y) > display.height()) {
+      // wrap back to top of screen
       _lastUsedLine = 1;
-      display.clearDisplay();
+      display.fillRect(0, CURSOR_SIZE_Y, display.width(), display.height() - CURSOR_SIZE_Y, COLOR_1B_WHITE);
     }
+    display.setCursor(1 * CURSOR_SIZE_X, _lastUsedLine++ * CURSOR_SIZE_Y);
+    display.println(message);
+    _lastUsedLine += willWrap(message.length());
+    updateDisplay(false);
   }
 }
 void ircSentCallback(String message) {
@@ -175,34 +170,43 @@ void loadConfig() {
   CFG.display.log_to_display = doc["display"]["log-to-display"];
 
   CFG.wifi.auto_connect = doc["wifi"]["auto-connect"];
+  memset(&(CFG.wifi.ssid), 0, sizeof(CFG.wifi.ssid));
   strlcpy(CFG.wifi.ssid,
     doc["wifi"]["ssid"] | "",
     sizeof(CFG.wifi.ssid));
+  memset(&(CFG.wifi.password), 0, sizeof(CFG.wifi.password));
   strlcpy(CFG.wifi.password,
     doc["wifi"]["password"] | "",
     sizeof(CFG.wifi.password));
 
   CFG.irc.auto_connect = doc["irc"]["auto-connect"];
+  memset(&(CFG.irc.server), 0, sizeof(CFG.irc.server));
   strlcpy(CFG.irc.server,
     doc["irc"]["server"] | "irc.libera.chat",
     sizeof(CFG.irc.server));
   CFG.irc.port = doc["irc"]["port"];
+  memset(&(CFG.irc.username), 0, sizeof(CFG.irc.username));
   strlcpy(CFG.irc.username,
     doc["irc"]["username"] | "inkplate",
     sizeof(CFG.irc.username));
+  memset(&(CFG.irc.nickname), 0, sizeof(CFG.irc.nickname));
   strlcpy(CFG.irc.nickname,
     doc["irc"]["nickname"] | "inkplate",
     sizeof(CFG.irc.nickname));
+  memset(&(CFG.irc.password), 0, sizeof(CFG.irc.password));
   strlcpy(CFG.irc.password,
     doc["irc"]["password"] | "",
     sizeof(CFG.irc.password));
+  memset(&(CFG.irc.channel), 0, sizeof(CFG.irc.channel));
   strlcpy(CFG.irc.channel,
-    doc["irc"]["channel"] | "",
+    doc["irc"]["channel"] | "##inkplate",
     sizeof(CFG.irc.channel));
 
+  memset(&(CFG.time.ntp_server), 0, sizeof(CFG.time.ntp_server));
   strlcpy(CFG.time.ntp_server,
     doc["time"]["ntp-server"] | "pool.ntp.org",
     sizeof(CFG.time.ntp_server));
+  memset(&(CFG.time.timezone), 0, sizeof(CFG.time.timezone));
   strlcpy(CFG.time.timezone,
     doc["time"]["timezone"] | "UTC",
     sizeof(CFG.time.timezone));
@@ -222,15 +226,17 @@ void connectToWifi() {
 
   Serial.print("Connecting to wifi");
   auto wifi_conn_start = millis();
+
+  WiFi.mode(WIFI_MODE_STA);
   WiFi.begin(CFG.wifi.ssid, CFG.wifi.password);
   while(!WiFi.isConnected()) {
-    if((millis() - wifi_conn_start) > WIFI_CONNECTION_TIMEOUT) {
+    if((millis() - wifi_conn_start) > WIFI_CONNECTION_TIMEOUT_MS) {
       Serial.println("TIMEOUT");
       WiFi.disconnect();
       return;
     }
     Serial.print(".");
-    delay(500);
+    delay(WIFI_CONNECTION_CHECK_INTERVAL_MS);
   }
   Serial.println("DONE");
   Serial.println("IP Address: " + WiFi.localIP().toString());
@@ -243,10 +249,10 @@ void connectToWifi() {
 
 void connectToIrc() {
   Serial.print("Connecting to IRC...");
-  if(ircclient->connect(CFG.irc.nickname, CFG.irc.username, CFG.irc.password)) {
+  if(ircClient->connect(CFG.irc.nickname, CFG.irc.username, CFG.irc.password)) {
     Serial.println(" DONE");
     if(CFG.irc.channel) {
-      ircclient->sendRaw("JOIN " + String(CFG.irc.channel));
+      ircClient->sendRaw("JOIN " + String(CFG.irc.channel));
     }
 
     display.setTextColor(COLOR_1B_BLACK);
@@ -268,7 +274,7 @@ void setupTime() {
     UTC.setTime(display.rtcGetEpoch(), 0);
     Serial.println("Time from RTC: " + UTC.dateTime(ISO8601));
   }
-  ezt::waitForSync(TIME_SYNC_TIMEOUT);
+  ezt::waitForSync(TIME_SYNC_TIMEOUT_S);
   if(CFG.time.use_rtc) {
     // set time to rtc
     display.rtcSetDate(UTC.weekday(), UTC.day(), UTC.month(), UTC.year());
@@ -310,27 +316,28 @@ void setup() {
     connectToWifi();
   }
 
-  if(ircclient == NULL) {
-    ircclient = new IRCClient(CFG.irc.server, CFG.irc.port, wificlient);
+  if(ircClient == NULL) {
+    ircClient = new IRCClient(CFG.irc.server, CFG.irc.port, wifiClient);
   }
 
-  ircclient->setCallback(ircCallback);
-  ircclient->setSentCallback(ircSentCallback);
+  ircClient->setCallback(ircCallback);
+  ircClient->setSentCallback(ircSentCallback);
 
   setupTime();
 }
 
 void drawStatusBar() {
-  auto _now = _TZ.dateTime("m/d H:i").c_str();
-  int screen_width = display.width();
-  int screen_height = display.height();
-  int temp_C = display.readTemperature();
-  float batt_V = display.readBattery();
-  int status_bar_right_offset = ((screen_width / CURSOR_SIZE_X) - strlen(StatusBarRightText)) * CURSOR_SIZE_X;
+  auto clockText = _TZ.dateTime(TIME_CLOCK_FORMAT);
+  char sensorsText[16];
+  auto temp_C = display.readTemperature();
+  auto batt_V = display.readBattery();
 
-  strlcpy(StatusBarLeftText, _now, strlen(_now)+1);
-  StatusBarLeftText[strlen(_now)+1] = '\0';
-  snprintf(StatusBarRightText, STATUS_BAR_RIGHT_SIZE, "%1.2fV %iC", batt_V, temp_C);
+  auto screen_width = display.width();
+
+  memset(&sensorsText, 0, sizeof(sensorsText));
+  snprintf(sensorsText, sizeof(sensorsText), "%1.2fV %iC", batt_V, temp_C);
+
+  auto sensorsTextOffset_px = screen_width - (strlen(sensorsText) * CURSOR_SIZE_X);
 
   if(CFG.display.invert_status_bar) {
     display.setTextColor(COLOR_1B_WHITE);
@@ -340,9 +347,9 @@ void drawStatusBar() {
     display.fillRect(0, 0, screen_width, CURSOR_SIZE_Y, COLOR_1B_WHITE);
   }
   display.setCursor(0, 0);
-  display.print(StatusBarLeftText);
-  display.setCursor(status_bar_right_offset, 0);
-  display.print(StatusBarRightText);
+  display.print(clockText);
+  display.setCursor(sensorsTextOffset_px, 0);
+  display.print(sensorsText);
 
   updateDisplay();
 }
@@ -356,8 +363,8 @@ void loop() {
 
   ezt::events();
 
-  if(CFG.irc.auto_connect && !ircclient->connected()) {
+  if(CFG.irc.auto_connect && !ircClient->connected()) {
     connectToIrc();
   }
-  ircclient->loop();
+  ircClient->loop();
 }
